@@ -1,117 +1,70 @@
 
 package school.sptech;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.List;
-
-import org.springframework.jdbc.core.JdbcTemplate;
-
-import school.sptech.config.DBConnectionProvider;
-import school.sptech.config.Jira;
 import school.sptech.config.S3Provider;
+import school.sptech.model.LeituraMaquina;
+import school.sptech.model.LimiteMetrica;
+import school.sptech.service.CsvReaderService;
+import school.sptech.service.DatabaseService;
+import school.sptech.service.JiraIssueService;
+import school.sptech.service.S3ObjectsService;
 
-import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.GetObjectRequest;
-import software.amazon.awssdk.services.s3.model.S3Object;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.Optional;
+
 
 public class ExemploCreateIssue {
 
     private static final String BUCKET_NAME = "biotrace-datalake";
 
-    public static void main(String[] args) {
-        try (S3Client s3Client = new S3Provider().getS3Client()) {
+    public static void main(String[] args) throws IOException, InterruptedException {
 
-            listarObjetos(s3Client);
-            baixarObjetos(s3Client);
-            criarIssueNoJira();
-            testarConexaoMySQL();
+        DatabaseService db = new DatabaseService();
+        JiraIssueService jira = new JiraIssueService();
+        S3Provider s3client = new S3Provider();
+        S3ObjectsService s3 = new S3ObjectsService(s3client.getS3Client(), BUCKET_NAME);
 
-        } catch (Exception e) {
-            System.err.println("Erro na execução: " + e.getMessage());
-            e.printStackTrace();
+        s3.listarObjetos();
+        s3.baixarObjetos();
+        db.testarConexaoMySQL();
+
+        CsvReaderService csv = new CsvReaderService();
+        List<LeituraMaquina> leituras = csv.ler(Path.of("silver.csv"));
+        Optional<LimiteMetrica> cpu = db.buscarPorTipoMetrica("cpu_percent");
+        Optional<LimiteMetrica> memoria = db.buscarPorTipoMetrica("cpu_percent");
+        Optional<LimiteMetrica> disco = db.buscarPorTipoMetrica("cpu_percent");
+
+        for (LeituraMaquina l : leituras) {
+            verificar(l.numeroSerie(), "cpu_percent",     l.cpuPercent(),  l.dataHora(),   cpu.orElse(null));
+            verificar(l.numeroSerie(), "memoria_percent", l.memoriaPercent(), l.dataHora(), memoria.orElse(null));
+            verificar(l.numeroSerie(), "disco_percent",   l.discoPercent(), l.dataHora(), disco.orElse(null));
+        }
+
+    }
+
+    private static void verificar(String serie, String tipoMetrica, Double valor,LocalDateTime dataHora, LimiteMetrica limite) throws IOException, InterruptedException {
+        if (valor == null || limite == null) return;
+        JiraIssueService jira = new JiraIssueService();
+        String horario = dataHora.format(FORMATO_DATA);
+
+        if (limite.limiteUso() != null && valor > limite.limiteUso()) {
+            String mensagem = "ALERTA | " + tipoMetrica + "acima do uso";
+            jira.criarIssueNoJira(horario,serie,mensagem);
+            System.out.println(serie + " | " + tipoMetrica + " acima do uso: " + valor);
+        }
+        if (limite.limiteOciosidade() != null && valor < limite.limiteOciosidade()) {
+            String mensagem = "ALERTA | " + tipoMetrica + "ocioso";
+            jira.criarIssueNoJira(horario,serie,mensagem);
+            System.out.println(serie + " | " + tipoMetrica + " ocioso: " + valor);
         }
     }
 
-    private static List<S3Object> listarObjetos(S3Client s3Client) {
-        List<S3Object> objetos = s3Client.listObjectsV2Paginator(
-                request -> request.bucket(BUCKET_NAME)
-        ).contents().stream().toList();
-
-        System.out.println("Objetos encontrados no bucket:");
-
-        for (S3Object objeto : objetos) {
-            System.out.println("- " + objeto.key());
-        }
-
-        return objetos;
-    }
-
-    private static void baixarObjetos(S3Client s3Client) throws IOException {
-        List<S3Object> objetos = listarObjetos(s3Client);
-        Path diretorioBase = Path.of("downloads").toAbsolutePath().normalize();
-
-        Files.createDirectories(diretorioBase);
-
-        for (S3Object objeto : objetos) {
-            Path destino = diretorioBase.resolve(objeto.key()).normalize();
-
-            // Impede que uma chave saia da pasta de destino.
-            if (!destino.startsWith(diretorioBase)) {
-                throw new IOException("Caminho de arquivo inválido: " + objeto.key());
-            }
-
-            Files.createDirectories(destino.getParent());
-
-            GetObjectRequest requisicao = GetObjectRequest.builder()
-                    .bucket(BUCKET_NAME)
-                    .key(objeto.key())
-                    .build();
-
-            try (InputStream inputStream = s3Client.getObject(requisicao)) {
-                Files.copy(
-                        inputStream,
-                        destino,
-                        java.nio.file.StandardCopyOption.REPLACE_EXISTING
-                );
-            }
-
-            System.out.println("Arquivo baixado: " + destino);
-        }
-    }
+    private static final DateTimeFormatter FORMATO_DATA =
+            DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss");
 
 
-
-    private static void criarIssueNoJira()
-            throws IOException, InterruptedException {
-
-        String baseUrl = System.getenv("JIRA_BASE_URL");
-        String email = System.getenv("JIRA_EMAIL");
-        String apiToken = System.getenv("JIRA_API_TOKEN");
-
-        Jira jira = new Jira(baseUrl, email, apiToken);
-
-        String resposta = jira.createIssue(
-                "AEIB",
-                "Issue criada via Java",
-                "Task"
-        );
-
-        System.out.println("Resposta do Jira: " + resposta);
-    }
-
-    private static void testarConexaoMySQL() {
-        DBConnectionProvider provider = new DBConnectionProvider();
-        JdbcTemplate jdbcTemplate = provider.getConnection();
-
-        String versao = jdbcTemplate.queryForObject(
-                "SELECT VERSION()",
-                String.class
-        );
-
-        System.out.println("Conexão com MySQL realizada!");
-        System.out.println("Versão: " + versao);
-    }
 }
